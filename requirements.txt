@@ -1,0 +1,5 @@
+discord.py
+anthropic
+requests
+aiohttp
+python-dotenv
