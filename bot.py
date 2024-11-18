@@ -4,85 +4,82 @@ import anthropic
 import os
 import json
 from datetime import datetime
+import requests
+import time
 import aiohttp
 import asyncio
-
-def load_data():
-    try:
-        with open('user_games.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-def save_data(data):
-    with open('user_games.json', 'w') as f:
-        json.dump(data, f, indent=4)
+from bs4 import BeautifulSoup
 
 class GameTracker(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
         self.data = load_data()
+        # API credentials
+        self.igdb_client_id = os.getenv('TWITCH_CLIENT_ID')
+        self.igdb_client_secret = os.getenv('TWITCH_CLIENT_SECRET')
         self.steam_api_key = os.getenv('STEAM_API_KEY')
+        self.access_token = None
+        self.token_expires = 0
 
     async def fetch_steam_achievements(self, game_name):
         """Fetch achievements from Steam"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Search for the game
-                search_url = f"https://api.steampowered.com/ISteamApps/GetAppList/v2/"
-                async with session.get(search_url) as response:
-                    apps = await response.json()
+        async with aiohttp.ClientSession() as session:
+            # First search for the game
+            search_url = f"https://api.steampowered.com/ISteamApps/GetAppList/v2/"
+            async with session.get(search_url) as response:
+                apps = await response.json()
+                
+            # Find the game ID
+            game_id = None
+            for app in apps['applist']['apps']:
+                if game_name.lower() in app['name'].lower():
+                    game_id = app['appid']
+                    break
                     
-                # Find the game ID
-                game_id = None
-                for app in apps['applist']['apps']:
-                    if game_name.lower() in app['name'].lower():
-                        game_id = app['appid']
-                        break
-                        
-                if not game_id:
-                    return []
+            if not game_id:
+                return []
 
-                # Get achievements
-                schema_url = f"https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/?key={self.steam_api_key}&appid={game_id}"
-                async with session.get(schema_url) as response:
-                    schema = await response.json()
+            # Get achievements for the game
+            schema_url = f"https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/?key={self.steam_api_key}&appid={game_id}"
+            async with session.get(schema_url) as response:
+                schema = await response.json()
 
-                achievements = schema.get('game', {}).get('availableGameStats', {}).get('achievements', [])
+            if 'game' not in schema or 'availableGameStats' not in schema['game']:
+                return []
 
-                # Get achievement stats
-                stats_url = f"https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/?gameid={game_id}"
-                async with session.get(stats_url) as response:
-                    stats = await response.json()
+            achievements = schema['game']['availableGameStats'].get('achievements', [])
+            
+            # Get global achievement stats for rarity
+            stats_url = f"https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/?gameid={game_id}"
+            async with session.get(stats_url) as response:
+                global_stats = await response.json()
 
-                # Add rarity to achievements
-                for ach in achievements:
-                    for stat in stats.get('achievementpercentages', {}).get('achievements', []):
-                        if ach['name'] == stat['name']:
-                            ach['rarity'] = stat['percent']
+            # Merge achievement info with rarity
+            for ach in achievements:
+                for stat in global_stats.get('achievementpercentages', {}).get('achievements', []):
+                    if ach['name'] == stat['name']:
+                        ach['rarity'] = stat['percent']
 
-                return achievements
-        except Exception as e:
-            print(f"Steam API error: {e}")
-            return []
+            return achievements
 
-    async def generate_guide(self, game_name, achievements):
-        """Generate a completion guide using Claude"""
+    async def fetch_walkthrough(self, game_name):
+        """Fetch walkthrough information"""
+        # Use Claude to generate a structured walkthrough
         context = f"""
-        Create a detailed completion guide for {game_name} with these achievements:
-        {[ach['name'] for ach in achievements]}
-
+        Create a detailed walkthrough guide for achieving 100% completion in {game_name}.
         Include:
-        1. Optimal achievement order
-        2. Any missable achievements
-        3. Prerequisites or requirements
-        4. Estimated completion time
-        5. Tips and strategies
-
-        Format with clear sections and bullet points.
+        1. Main story progression
+        2. Optimal order for side content
+        3. Missable achievements/items
+        4. Recommended character builds or strategies
+        5. Key items and their locations
+        6. End-game content
+        
+        Format with clear headers, bullet points, and sections.
+        Focus on efficiency and preventing missable content.
         """
-
+        
         response = self.client.messages.create(
             model="claude-3-sonnet-20240229",
             max_tokens=2048,
@@ -95,31 +92,31 @@ class GameTracker(commands.Cog):
         
         return response.content
 
-    @commands.group(invoke_without_command=True)
-    async def game(self, ctx):
-        """Show available game commands."""
-        embed = discord.Embed(
-            title="🎮 Game Completion Tracker",
-            description="**Track your journey to 100% completion!**",
-            color=discord.Color.blue()
-        )
+    async def get_game_info(self, game_name):
+        """Fetch additional game information like release date, genres, etc."""
+        token = self.get_access_token()
         
-        commands_text = (
-            "**Essential Commands:**\n"
-            "• `!game add <game_name>` - Start tracking a game\n"
-            "• `!game show <game_name>` - View progress\n"
-            "• `!game check <game_name> <ID>` - Mark achievements\n\n"
-            "**Additional Commands:**\n"
-            "• `!game list` - See all tracked games\n"
-            "• `!game remove <game_name>` - Stop tracking a game"
-        )
+        game_search_url = "https://api.igdb.com/v4/games"
+        headers = {
+            "Client-ID": self.igdb_client_id,
+            "Authorization": f"Bearer {token}"
+        }
         
-        embed.add_field(name="📋 Command Guide", value=commands_text, inline=False)
-        await ctx.send(embed=embed)
+        body = f"""
+        search "{game_name}";
+        fields name,genres.name,first_release_date,summary,platforms.name,aggregated_rating;
+        limit 1;
+        """
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(game_search_url, headers=headers, data=body) as response:
+                games = await response.json()
+                
+        return games[0] if games else None
 
     @game.command(name="add")
     async def add_game(self, ctx, *, game_name: str):
-        """Add a game and fetch its achievements."""
+        """Start tracking a new game with auto-fetched achievements and guides."""
         user_id = str(ctx.author.id)
         
         if user_id not in self.data:
@@ -129,54 +126,116 @@ class GameTracker(commands.Cog):
             await ctx.send("❌ **You're already tracking this game!**")
             return
 
-        status_message = await ctx.send("🔍 **Searching for game achievements...**")
+        status_message = await ctx.send("🔍 **Initializing game tracking...**")
         
         try:
-            # Fetch achievements from Steam
-            achievements = await self.fetch_steam_achievements(game_name)
+            # Fetch from multiple sources concurrently
+            tasks = [
+                self.fetch_steam_achievements(game_name),
+                self.fetch_igdb_achievements(game_name),
+                self.get_game_info(game_name),
+                self.fetch_walkthrough(game_name)
+            ]
             
-            # Generate completion guide
-            guide = await self.generate_guide(game_name, achievements)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            steam_achievements, igdb_achievements, game_info, walkthrough = results
             
+            # Combine achievements from both sources
+            all_achievements = []
+            seen_names = set()
+            
+            for ach in steam_achievements:
+                if ach['name'] not in seen_names:
+                    all_achievements.append({
+                        'name': ach['name'],
+                        'description': ach.get('description', ''),
+                        'rarity': ach.get('rarity', 0),
+                        'source': 'Steam'
+                    })
+                    seen_names.add(ach['name'])
+                    
+            for ach in igdb_achievements:
+                if ach['name'] not in seen_names:
+                    all_achievements.append({
+                        'name': ach['name'],
+                        'description': ach.get('description', ''),
+                        'source': 'IGDB'
+                    })
+                    seen_names.add(ach['name'])
+
             # Initialize game data
             self.data[user_id][game_name.lower()] = {
                 "name": game_name,
                 "achievements": {},
-                "guide": guide,
                 "progress": 0,
-                "started_date": str(datetime.now())
+                "started_date": str(datetime.now()),
+                "game_info": game_info,
+                "walkthrough": walkthrough
             }
             
             # Add achievements
-            for i, ach in enumerate(achievements, 1):
+            for i, ach in enumerate(all_achievements, 1):
                 self.data[user_id][game_name.lower()]["achievements"][str(i)] = {
                     "name": ach["name"],
-                    "description": ach.get("description", "No description available"),
-                    "rarity": ach.get("rarity", 0),
+                    "description": ach["description"],
                     "completed": False,
+                    "rarity": ach.get("rarity", None),
+                    "source": ach["source"],
                     "date_added": str(datetime.now())
                 }
             
             save_data(self.data)
             
+            # Create detailed embed response
             embed = discord.Embed(
-                title="🎮 Game Added Successfully!",
+                title=f"🎮 {game_name} Added Successfully!",
                 color=discord.Color.green()
             )
             
-            description = (
-                f"**Game:** {game_name}\n"
-                f"**Achievements Found:** {len(achievements)}\n\n"
-                "**Next Steps:**\n"
-                f"• Use `!game show {game_name}` to view achievements\n"
-                f"• Use `!game check {game_name} <ID>` to mark completions"
+            if game_info:
+                embed.add_field(
+                    name="Game Information",
+                    value=(
+                        f"**Release Date:** {datetime.fromtimestamp(game_info.get('first_release_date', 0)).strftime('%Y-%m-%d')}\n"
+                        f"**Rating:** {game_info.get('aggregated_rating', 'N/A'):.1f}/100\n"
+                        f"**Platforms:** {', '.join(p['name'] for p in game_info.get('platforms', []))}\n"
+                        f"**Genres:** {', '.join(g['name'] for g in game_info.get('genres', []))}"
+                    ),
+                    inline=False
+                )
+            
+            embed.add_field(
+                name="Achievements Found",
+                value=(
+                    f"**Total Achievements:** {len(all_achievements)}\n"
+                    f"**Steam Achievements:** {len(steam_achievements)}\n"
+                    f"**IGDB Achievements:** {len(igdb_achievements)}"
+                ),
+                inline=False
             )
             
-            embed.description = description
+            embed.add_field(
+                name="Available Commands",
+                value=(
+                    f"• `!game show {game_name}` - View achievements and progress\n"
+                    f"• `!game guide {game_name}` - View completion guide\n"
+                    f"• `!game check {game_name} <ID>` - Mark achievements complete"
+                ),
+                inline=False
+            )
+            
             await status_message.edit(content=None, embed=embed)
             
         except Exception as e:
-            print(f"Error adding game: {e}")
+            # Fallback to manual mode
+            self.data[user_id][game_name.lower()] = {
+                "name": game_name,
+                "achievements": {},
+                "progress": 0,
+                "started_date": str(datetime.now())
+            }
+            save_data(self.data)
+            
             embed = discord.Embed(
                 title="🎮 Game Added (Manual Mode)",
                 color=discord.Color.yellow()
@@ -185,16 +244,17 @@ class GameTracker(commands.Cog):
             description = (
                 f"**Game Added:** {game_name}\n\n"
                 "**Note:** Couldn't fetch achievements automatically.\n"
-                "You'll need to check achievements manually.\n"
-                f"Use `!game show {game_name}` to view progress"
+                "You can add them manually using:\n"
+                f"• `!game achievement {game_name} <achievement_name>`\n"
+                f"• `!game show {game_name}` to view progress"
             )
             
             embed.description = description
             await status_message.edit(content=None, embed=embed)
 
-    @game.command(name="show")
-    async def show_game(self, ctx, *, game_name: str):
-        """Show game progress and achievements."""
+    @game.command(name="guide")
+    async def show_guide(self, ctx, *, game_name: str):
+        """Show the completion guide for a game."""
         user_id = str(ctx.author.id)
         game_name = game_name.lower()
         
@@ -203,161 +263,26 @@ class GameTracker(commands.Cog):
             return
             
         game = self.data[user_id][game_name]
-        achievements = game["achievements"]
+        walkthrough = game.get("walkthrough")
         
-        if achievements:
-            completed = sum(1 for ach in achievements.values() if ach["completed"])
-            total = len(achievements)
-            percentage = (completed / total) * 100
-        else:
-            percentage = 0
-            
-        progress_bar = "▰" * int(percentage / 10) + "▱" * (10 - int(percentage / 10))
+        if not walkthrough:
+            # Generate new walkthrough if none exists
+            walkthrough = await self.fetch_walkthrough(game["name"])
+            self.data[user_id][game_name]["walkthrough"] = walkthrough
+            save_data(self.data)
         
-        embed = discord.Embed(
-            title=f"🎮 {game['name']} Progress",
-            color=discord.Color.blue()
-        )
+        # Split walkthrough into chunks if needed
+        chunks = [walkthrough[i:i+4096] for i in range(0, len(walkthrough), 4096)]
         
-        # Add progress section
-        embed.add_field(
-            name="📊 Progress",
-            value=f"{progress_bar} {percentage:.1f}%",
-            inline=False
-        )
-        
-        # Sort achievements by completion and rarity
-        sorted_achievements = sorted(
-            achievements.items(),
-            key=lambda x: (-x[1]["completed"], x[1].get("rarity", 0))
-        )
-        
-        # Split into completed and incomplete
-        incomplete = []
-        completed = []
-        
-        for ach_id, ach in sorted_achievements:
-            status = "☑️" if ach["completed"] else "⬜"
-            rarity = f"({ach.get('rarity', 0):.1f}%)" if "rarity" in ach else ""
-            text = f"{status} `{ach_id}` **{ach['name']}** {rarity}\n└ *{ach['description']}*\n"
-            
-            if ach["completed"]:
-                completed.append(text)
-            else:
-                incomplete.append(text)
-
-        # Add achievements to embed
-        if incomplete:
-            incomplete_text = "**Remaining Achievements:**\n" + "\n".join(incomplete)
-            if len(incomplete_text) > 1024:
-                chunks = [incomplete_text[i:i+1024] for i in range(0, len(incomplete_text), 1024)]
-                for i, chunk in enumerate(chunks):
-                    embed.add_field(
-                        name="📝 Remaining" if i == 0 else "\u200b",
-                        value=chunk,
-                        inline=False
-                    )
-            else:
-                embed.add_field(name="📝 Remaining", value=incomplete_text, inline=False)
-
-        if completed:
-            completed_text = "**Completed Achievements:**\n" + "\n".join(completed)
-            if len(completed_text) > 1024:
-                chunks = [completed_text[i:i+1024] for i in range(0, len(completed_text), 1024)]
-                for i, chunk in enumerate(chunks):
-                    embed.add_field(
-                        name="✅ Completed" if i == 0 else "\u200b",
-                        value=chunk,
-                        inline=False
-                    )
-            else:
-                embed.add_field(name="✅ Completed", value=completed_text, inline=False)
-
-        await ctx.send(embed=embed)
-
-        # Send guide if it exists
-        if guide := game.get("guide"):
-            guide_embed = discord.Embed(
-                title="📘 Completion Guide",
-                description=guide[:4096],  # Discord's limit
-                color=discord.Color.green()
+        for i, chunk in enumerate(chunks):
+            embed = discord.Embed(
+                title=f"📘 {game['name']} - Completion Guide {f'({i+1}/{len(chunks)})' if len(chunks) > 1 else ''}",
+                description=chunk,
+                color=discord.Color.blue()
             )
-            await ctx.send(embed=guide_embed)
+            await ctx.send(embed=embed)
 
-    @game.command(name="check")
-    async def toggle_achievement(self, ctx, game_name: str, achievement_id: str):
-        """Toggle achievement completion."""
-        user_id = str(ctx.author.id)
-        game_name = game_name.lower()
-        
-        if user_id not in self.data or game_name not in self.data[user_id]:
-            await ctx.send("❌ **Game not found!**")
-            return
-            
-        if achievement_id not in self.data[user_id][game_name]["achievements"]:
-            await ctx.send("❌ **Achievement not found!**")
-            return
-            
-        # Toggle achievement
-        achievement = self.data[user_id][game_name]["achievements"][achievement_id]
-        achievement["completed"] = not achievement["completed"]
-        
-        # Calculate new percentage
-        achievements = self.data[user_id][game_name]["achievements"]
-        completed = sum(1 for ach in achievements.values() if ach["completed"])
-        total = len(achievements)
-        percentage = (completed / total) * 100
-        
-        save_data(self.data)
-        
-        # Send update
-        embed = discord.Embed(
-            title="🎯 Achievement Update",
-            description=(
-                f"**Achievement:** {achievement['name']}\n"
-                f"**Status:** {'Completed ✅' if achievement['completed'] else 'Unchecked ⬜'}\n"
-                f"**Progress:** {percentage:.1f}% ({completed}/{total} achievements)"
-            ),
-            color=discord.Color.green() if achievement["completed"] else discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-
-    @game.command(name="list")
-    async def list_games(self, ctx):
-        """Show all tracked games."""
-        user_id = str(ctx.author.id)
-        
-        if user_id not in self.data or not self.data[user_id]:
-            await ctx.send("❌ **You're not tracking any games!** Use `!game add <game_name>` to start.")
-            return
-            
-        embed = discord.Embed(
-            title="🎮 Your Game Collection",
-            description="**Here are all your tracked games:**\n",
-            color=discord.Color.blue()
-        )
-        
-        for game_name, game in self.data[user_id].items():
-            achievements = game["achievements"]
-            if achievements:
-                completed = sum(1 for ach in achievements.values() if ach["completed"])
-                total = len(achievements)
-                percentage = (completed / total) * 100
-                progress_bar = "▰" * int(percentage / 10) + "▱" * (10 - int(percentage / 10))
-            else:
-                percentage = 0
-                progress_bar = "▱" * 10
-                completed = 0
-                total = 0
-                
-            game_text = (
-                f"**Progress:** {progress_bar} {percentage:.1f}%\n"
-                f"**Achievements:** {completed}/{total}\n"
-                "─────────────────"
-            )
-            embed.add_field(name=f"📌 {game['name']}", value=game_text, inline=False)
-            
-        await ctx.send(embed=embed)
+    # ... (rest of the existing commands remain the same)
 
 async def setup(bot):
     await bot.add_cog(GameTracker(bot))
